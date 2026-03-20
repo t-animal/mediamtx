@@ -1,0 +1,220 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>WHIP/WHEP Absolute Timestamp Probe</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 24px;
+      max-width: 900px;
+    }
+
+    video {
+      width: 420px;
+      background: #000;
+      margin-right: 12px;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    pre {
+      background: #f5f5f5;
+      padding: 12px;
+      overflow: auto;
+    }
+
+    button {
+      margin-right: 8px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>WHIP/WHEP absolute timestamp probe</h1>
+  <p>
+    Path: <input id="path" value="mystream" />
+    Server: <input id="base" value="http://localhost:8889" size="28" />
+    <button id="connect-whip">Connect WHIP</button>
+    <button id="connect-whep">Connect WHEP</button>
+    <button id="stop">Stop</button>
+  </p>
+  <div class="row">
+    <div>
+      <h3>Local publish preview</h3>
+      <video id="local" autoplay muted playsinline></video>
+    </div>
+    <div>
+      <h3>Loopback WHEP playback</h3>
+      <video id="remote" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <h3>Stats</h3>
+  <pre id="log"></pre>
+  <script>
+    let pubPC, readPC, localStream, statsTimer;
+
+    const logEl = document.getElementById("log");
+    const localVideo = document.getElementById("local");
+    const remoteVideo = document.getElementById("remote");
+    const ntpUnixOffsetMs =
+      new Date("1970-01-01T00:00:00Z").getTime() -
+      new Date("1900-01-01T00:00:00Z").getTime();
+    const oneHundredYearsMilliseconds = 100 * 365.25 * 24 * 60 * 60 * 1000;
+
+    // Browsers disagree on epoch for estimatedPlayoutTimestamp:
+    // Firefox reports Unix-based time, while Chrome can expose NTP-based time.
+    // Normalize everything to Unix milliseconds before comparison with Date.now().
+    function sanitizeTimestampToUnixMs(timestampMilliseconds) {
+      if (timestampMilliseconds > oneHundredYearsMilliseconds) {
+        return timestampMilliseconds - ntpUnixOffsetMs;
+      }
+
+      return timestampMilliseconds;
+    }
+
+    function log(msg) {
+      logEl.textContent = msg + "\n" + logEl.textContent.slice(0, 6000);
+    }
+
+    async function postSDP(url, sdp) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: sdp
+      });
+      if (!res.ok) throw new Error("POST " + url + " failed: " + res.status);
+      const location = res.headers.get("Location");
+      const answer = await res.text();
+      return { answer, location };
+    }
+
+    function getConfig() {
+      const base = document.getElementById("base").value.replace(/\/+$/, "");
+      const path = document.getElementById("path").value.replace(/^\/+|\/+$/g, "");
+      return {
+        whipURL: base + "/" + path + "/whip",
+        whepURL: base + "/" + path + "/whep"
+      };
+    }
+
+    async function ensureLocalStream() {
+      if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localVideo.srcObject = localStream;
+      }
+    }
+
+    async function connectWhip() {
+      const { whipURL } = getConfig();
+
+      if (pubPC) {
+        log("WHIP already connected");
+        return;
+      }
+
+      await ensureLocalStream();
+      log("Connecting WHIP: " + whipURL);
+
+      pubPC = new RTCPeerConnection();
+      for (const tr of localStream.getTracks()) pubPC.addTrack(tr, localStream);
+
+      const pubOffer = await pubPC.createOffer();
+      await pubPC.setLocalDescription(pubOffer);
+      const pubResp = await postSDP(whipURL, pubPC.localDescription.sdp);
+      await pubPC.setRemoteDescription({ type: "answer", sdp: pubResp.answer });
+      log("WHIP connected");
+    }
+
+    async function connectWhep() {
+      const { whepURL } = getConfig();
+
+      if (readPC) {
+        log("WHEP already connected");
+        return;
+      }
+
+      log("Connecting WHEP: " + whepURL);
+
+      readPC = new RTCPeerConnection();
+      readPC.addTransceiver("video", { direction: "recvonly" });
+      readPC.addTransceiver("audio", { direction: "recvonly" });
+
+      readPC.ontrack = (ev) => {
+        remoteVideo.srcObject = ev.streams[0];
+      };
+
+      const readOffer = await readPC.createOffer();
+      await readPC.setLocalDescription(readOffer);
+      const readResp = await postSDP(whepURL, readPC.localDescription.sdp);
+      await readPC.setRemoteDescription({ type: "answer", sdp: readResp.answer });
+      log("WHEP connected");
+
+      if (statsTimer) clearInterval(statsTimer);
+
+      statsTimer = setInterval(async () => {
+        if (!readPC) return;
+
+        const stats = await readPC.getStats();
+        const now = Date.now();
+        const lines = [];
+
+        stats.forEach((r) => {
+          if (r.type === "inbound-rtp" && !r.isRemote) {
+            const kind = r.kind || "unknown";
+            const ept = r.estimatedPlayoutTimestamp;
+            if (typeof ept === "number") {
+              const sanitizedEpt = sanitizeTimestampToUnixMs(ept);
+              const deltaMs = sanitizedEpt - now;
+              lines.push(
+                kind +
+                " estimatedPlayoutTimestamp=" + sanitizedEpt.toFixed(3) +
+                " now=" + now +
+                " deltaMs=" + deltaMs.toFixed(3) +
+                " jitter=" + ((r.jitter || 0) * 1000).toFixed(3) + "ms"
+              );
+            } else {
+              lines.push(kind + " estimatedPlayoutTimestamp=not exposed by this browser");
+            }
+          }
+        });
+
+        if (lines.length) log(lines.join("\n"));
+      }, 1000);
+    }
+
+    function stop() {
+      if (statsTimer) clearInterval(statsTimer);
+      statsTimer = null;
+
+      if (pubPC) pubPC.close();
+      if (readPC) readPC.close();
+      pubPC = null;
+      readPC = null;
+
+      if (localStream) {
+        for (const t of localStream.getTracks()) t.stop();
+      }
+      localStream = null;
+      localVideo.srcObject = null;
+      remoteVideo.srcObject = null;
+      log("stopped");
+    }
+
+    document.getElementById("connect-whip").onclick = () =>
+      connectWhip().catch(e => log("ERROR: " + e.message));
+
+    document.getElementById("connect-whep").onclick = () =>
+      connectWhep().catch(e => log("ERROR: " + e.message));
+
+    document.getElementById("stop").onclick = stop;
+  </script>
+</body>
+
+</html>
